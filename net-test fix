@@ -1,0 +1,4 @@
+net-test fix
+
+
+sed -i 's|networkctl status|networkctl --no-pager status|g' /hive/bin/net-test
