@@ -61,7 +61,6 @@ prev_modify_conf=
 prev_flag_time=
 badgpu_count=
 
-
 function loadconf() {
 	PUSH_INTERVAL=10
 	WD_ENABLED=
