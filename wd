@@ -24,6 +24,11 @@ SHARES_INTERVAL=15 # minutes
 SHARES_ACC_ARR=()
 SHARES_BAD_ARR=()
 
+# --- STARTUP GRACE PERIOD ---
+# Fallback if WD_MINER is not set. Otherwise grace = WD_MINER minutes.
+STARTUP_GRACE=${STARTUP_GRACE:-300}
+startup_grace=$STARTUP_GRACE
+
 LAST_STAT="/run/hive/last_stat.json"
 DELAY_FILE="/run/hive/wd_delay"
 
@@ -86,6 +91,14 @@ function loadconf() {
 
 	source $RIG_CONF
 
+	# Grace period equals miner restart timeout (WD_MINER minutes),
+	# so watchdog waits exactly as long as its own restart policy.
+	if [[ ! -z $WD_MINER && $WD_MINER =~ ^[0-9]+$ ]]; then
+		startup_grace=$(( WD_MINER * 60 ))
+	else
+		startup_grace=$STARTUP_GRACE
+	fi
+
 	if [[ $WD_ENABLED != 1 ]]; then
 		[[ $disable != 1 ]] && echo "${YELLOW}Watchdog disabled in config ($RIG_CONF)${NOCOLOR}"
 		disable=1
@@ -131,11 +144,15 @@ function loadconf() {
 	if [[ -z $prev_flag_time ]]; then
 		wd_algo=$(< $RUNNING_FLAG)
 		prev_flag_time=$flag_time
-	elif [[ $prev_flag_time != $flag_time && $miner_restart_count -eq 0 ]]; then
+	elif [[ $prev_flag_time != $flag_time ]]; then
+		# Miner was (re)started — give it a grace period regardless of restart count
 		changed_miner=1
 		wd_algo=
 		rm $LAST_STAT 2>/dev/null
 		prev_flag_time=$flag_time
+		miner_restart_count=0
+		set_lastgood
+		echo "${YELLOW}Miner restarted, startup grace period: ${startup_grace}s${NOCOLOR}"
 		return # reread last_stat on next cycle
 	fi
 
@@ -184,12 +201,9 @@ function loadconf() {
 
 
 function set_lastgood() {
-	#lastgood=`date +%s`
-	[[ -f $HASHRATE_KHS ]] &&
-		lastgood=`stat -c %Y $HASHRATE_KHS` ||
-		#lastgood=0 can't set it to 0, in case of boot agent may be late
-		lastgood=`date +%s` #let's count from now
-
+	# Always use current time. Using mtime of HASHRATE_KHS can be stale
+	# after miner update/restart, causing huge elapsed and immediate reboot.
+	lastgood=`date +%s`
 	miner_restart_count=0
 }
 
@@ -293,9 +307,11 @@ function check_power() {
 		return
 	fi
 	echo "${RED}GPU POWER: $msg${NOCOLOR}"
-	reboot_timeout=$((${WD_REBOOT:-1}*60))
-	if [[ $(( gpu_power_count * WD_SLEEP * 2 )) -ge $reboot_timeout ]]; then
+	if [[ $gpu_power_count -eq 3 ]]; then
+			get_gpu_info | message warn "GPU power $msg" payload >/dev/null
+	elif [[ $gpu_power_count -ge 6 ]]; then
 		get_gpu_info | message error "GPU power $msg, rebooting" payload >/dev/null
+		#WD_POWER_ACTION
 		sreboot
 	fi
 	((gpu_power_count++))
@@ -438,6 +454,34 @@ function loop() {
 	fi
 	now=$new
 
+	# --- SAFETY: ensure lastgood is valid before computing elapsed ---
+	if [[ -z $lastgood || $lastgood -eq 0 ]]; then
+		set_lastgood
+		now=
+		return
+	fi
+
+	# --- STARTUP GRACE CHECK ---
+	# If miner was started less than startup_grace seconds ago, skip hashrate check
+	if [[ -f $RUNNING_FLAG ]]; then
+		local flag_age=$(( now - $(stat -c %Y $RUNNING_FLAG) ))
+		if [[ $flag_age -lt $startup_grace ]]; then
+			[[ $ok_count == 0 ]] && echo "${YELLOW}Startup grace: ${flag_age}s / ${startup_grace}s, skipping hashrate check${NOCOLOR}"
+			((ok_count++))
+			[[ $ok_count -ge $OK_MESSAGE_REDUCE ]] && ok_count=0
+			set_lastgood
+			return
+		fi
+	else
+		# RUNNING_FLAG missing while watchdog is enabled: give miner time to start
+		[[ $ok_count == 0 ]] && echo "${YELLOW}Miner flag missing, waiting for startup${NOCOLOR}"
+		((ok_count++))
+		[[ $ok_count -ge $OK_MESSAGE_REDUCE ]] && ok_count=0
+		set_lastgood
+		return
+	fi
+	# --- END STARTUP GRACE CHECK ---
+
 	local elapsed=$(( now - lastgood ))
 	#echo Elapsed $elapsed seconds
 
@@ -565,6 +609,8 @@ function run() {
 		echo "ACCEPTED SHARE RATE:  ${WD_ASR}%"
 	[[ $WD_SHARE_TIME -gt 0 ]] &&
 		echo "MAX NO SHARE TIME:    $WD_SHARE_TIME minutes"
+
+	echo "STARTUP GRACE:        ${startup_grace}s${WD_MINER:+ (from WD_MINER=$WD_MINER min)}"
 
 	while true; do
 		loop
